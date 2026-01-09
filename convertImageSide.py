@@ -659,6 +659,26 @@ class App(RootBase):
         self.info_label.config(text="")
         self._preview_tk = None
 
+    def _retain_failed_tasks(self, failed_paths: set[str]):
+        if not self.tasks:
+            return
+        kept = [t for t in self.tasks if t.src_path in failed_paths]
+        self.tasks = kept
+        self.task_index = {t.src_path: i for i, t in enumerate(self.tasks)}
+
+        self.listbox.delete(0, "end")
+        for t in self.tasks:
+            self.listbox.insert("end", os.path.basename(t.src_path))
+
+        if self.tasks:
+            self.listbox.selection_clear(0, "end")
+            self.listbox.selection_set(0)
+            self.on_select_task(None)
+        else:
+            self.preview_label.config(image="")
+            self.info_label.config(text="")
+            self._preview_tk = None
+
     # ---------------- recompute/preview ----------------
 
     def _get_int(self, s: str, default: int) -> int:
@@ -852,6 +872,7 @@ class App(RootBase):
                 return
 
             async def _run_batch():
+                input_to_src = {tmp_in: src_path for (_, tmp_in, _, src_path) in prepared}
                 cfg = Config(
                     tinyReqMode=TinyReqMode.WEB,   # ✅ 用你之前的 WEB 模式
                     mail="api",                    # WEB 模式这两个字段未必用得上，但保留
@@ -863,33 +884,68 @@ class App(RootBase):
                 # 可选：如果你想在 UI 上显示状态，你需要先在 UI 里放一个 status label
                 # 这里我用 log 输出，如果你有 self.status_label，就改成 self.after(...) 更新它
                 def on_finished(res: CompressResult):
-                    self.log(f"[Tinify OK] {os.path.basename(res.output_path)} ({res.size} bytes)")
+                    src = input_to_src.get(res.input_path, res.input_path)
+                    self.log(f"[Tinify OK] {os.path.basename(src)} ({res.size} bytes)")
 
                 def on_error(res: CompressResult):
-                    self.log(f"[Tinify ERR] {res.errmsg}")
+                    src = input_to_src.get(res.input_path, res.input_path)
+                    self.log(f"[Tinify ERR] {os.path.basename(src)} -> {res.errmsg}")
 
                 async with TinifyAsyncCompressor(cfg, on_finished=on_finished, on_error=on_error) as comp:
                     sem = asyncio.Semaphore(concurrency)
 
                     async def _one(tmp_in: str, out_path: str, src_path: str):
+                        if self._stop_flag.is_set():
+                            raise asyncio.CancelledError()
                         async with sem:
+                            if self._stop_flag.is_set():
+                                raise asyncio.CancelledError()
                             res = await comp.compress_one(tmp_in, out_path)
                             if not res.ok:
                                 raise RuntimeError(f"{os.path.basename(src_path)} -> {res.errmsg}")
                             return res
 
-                    jobs = [_one(tmp_in, out_path, src_path) for (_, tmp_in, out_path, src_path) in prepared]
-                    return await asyncio.gather(*jobs, return_exceptions=True)
+                    tasks = [
+                        asyncio.create_task(_one(tmp_in, out_path, src_path))
+                        for (_, tmp_in, out_path, src_path) in prepared
+                    ]
+
+                    async def _watch_stop():
+                        stop_logged = False
+                        while True:
+                            if all(t.done() for t in tasks):
+                                return
+                            if self._stop_flag.is_set():
+                                if not stop_logged:
+                                    self.log("收到停止请求：正在取消压缩任务...")
+                                    stop_logged = True
+                                for t in tasks:
+                                    t.cancel()
+                                return
+                            await asyncio.sleep(0.2)
+
+                    watcher = asyncio.create_task(_watch_stop())
+                    try:
+                        return await asyncio.gather(*tasks, return_exceptions=True)
+                    finally:
+                        watcher.cancel()
             self.log("开始 Tinify 批量压缩（最后一步）...")
             results = asyncio.run(_run_batch())
 
             ok = 0
-            for r in results:
-                if isinstance(r, Exception):
+            failed_paths = {t.src_path for t in self.tasks}
+            stop_logged = False
+            for idx, r in enumerate(results):
+                if isinstance(r, asyncio.CancelledError):
+                    if not stop_logged:
+                        self.log("[Tinify STOP] 已取消剩余压缩任务。")
+                        stop_logged = True
+                elif isinstance(r, Exception):
                     self.log(f"[Tinify ERR] {r}")
                 else:
                     ok += 1
                     self.log(f"[Tinify OK] {r.output_path} ({r.size} bytes)")
+                    failed_paths.discard(prepared[idx][3])
 
             for td, *_ in prepared:
                 try:
@@ -897,6 +953,13 @@ class App(RootBase):
                 except Exception:
                     pass
 
+            if failed_paths:
+                failed_names = ", ".join(sorted(os.path.basename(p) for p in failed_paths))
+                self.log(f"[Tinify FAIL LIST] {failed_names}")
+            else:
+                self.log("[Tinify FAIL LIST] 无")
+
+            self.after(0, lambda: self._retain_failed_tasks(failed_paths))
             self._show_info_threadsafe("完成", f"压缩完成：{ok}/{len(results)}")
 
         except Exception as e:
