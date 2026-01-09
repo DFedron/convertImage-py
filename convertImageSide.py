@@ -87,6 +87,32 @@ def _license_cache_path(app_name="atlas_packer") -> str:
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, "time_cache.json")
 
+
+def _settings_path(app_name="convertImageSide") -> str:
+    base = os.path.join(os.path.expanduser("~"), f".{app_name}")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "settings.json")
+
+
+def load_settings(app_name="convertImageSide") -> dict:
+    p = _settings_path(app_name)
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict, app_name="convertImageSide"):
+    p = _settings_path(app_name)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=True, indent=2)
+    except Exception:
+        pass
+
 def load_cached_network_time(app_name="atlas_packer") -> datetime.datetime | None:
     p = _license_cache_path(app_name)
     if not os.path.exists(p):
@@ -207,13 +233,13 @@ def align_to_4(n: int, mode: str = "up") -> int:
 
 def downscale_to_max_side(w: int, h: int, max_side: int) -> tuple[int, int, float]:
     """
-    只缩小不放大：如果 max(w,h) > max_side，则等比缩到 max_side
+    等比缩放到最长边=max_side（允许放大或缩小）
     返回：base_w, base_h, pre_scale
     """
     if max_side <= 0:
         return w, h, 1.0
     m = max(w, h)
-    if m <= max_side:
+    if m <= 0:
         return w, h, 1.0
 
     pre_scale = max_side / m
@@ -227,6 +253,7 @@ def compute_target_canvas(
     src_h: int,
     use_max_side: bool,
     max_side: int,
+    allow_upscale: bool,
     use_align4: bool,
     align_mode: str,
     out_w: int,
@@ -242,14 +269,25 @@ def compute_target_canvas(
     if use_max_side:
         base_w, base_h, pre_scale = downscale_to_max_side(src_w, src_h, max_side)
     else:
-        base_w, base_h, pre_scale = out_w, out_h, 1.0
+        scale = min(out_w / src_w, out_h / src_h)
+        if not allow_upscale:
+            scale = min(scale, 1.0)
+        base_w = max(1, int(round(src_w * scale)))
+        base_h = max(1, int(round(src_h * scale)))
+        pre_scale = scale
 
     if use_align4:
-        canvas_w = align_to_4(base_w, align_mode)
-        canvas_h = align_to_4(base_h, align_mode)
+        canvas_w = align_to_4(base_w if use_max_side else out_w, align_mode)
+        canvas_h = align_to_4(base_h if use_max_side else out_h, align_mode)
         return canvas_w, canvas_h, base_w, base_h, pre_scale
 
-    return base_w, base_h, base_w, base_h, pre_scale
+    return (
+        base_w if use_max_side else out_w,
+        base_h if use_max_side else out_h,
+        base_w,
+        base_h,
+        pre_scale,
+    )
 
 
 def expand_image_to_canvas(
@@ -346,7 +384,9 @@ class App(RootBase):
 
         self._preview_tk = None
 
+        self._load_settings()
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if DND_OK:
             self.drop_target_register(DND_FILES)
@@ -380,7 +420,7 @@ class App(RootBase):
         row2 = tk.Frame(top)
         row2.pack(fill="x", pady=(6, 2))
 
-        tk.Checkbutton(row2, text="最大尺寸（只缩小不放大）", variable=self.use_max_side,
+        tk.Checkbutton(row2, text="最大尺寸（最长边= max_side）", variable=self.use_max_side,
                        command=self.rebuild_all_tasks).pack(side="left")
         tk.Label(row2, text="max_side:").pack(side="left", padx=(8, 0))
         tk.Entry(row2, textvariable=self.max_side, width=8).pack(side="left")
@@ -484,6 +524,48 @@ class App(RootBase):
         else:
             self.out_entry.configure(state="normal")
             self.out_btn.configure(state="normal")
+
+    def _load_settings(self):
+        cfg = load_settings()
+        if not cfg:
+            return
+        self.output_dir.set(cfg.get("output_dir", self.output_dir.get()))
+        self.suffix.set(cfg.get("suffix", self.suffix.get()))
+        self.overwrite.set(bool(cfg.get("overwrite", self.overwrite.get())))
+        self.bg.set(cfg.get("bg", self.bg.get()))
+        self.allow_upscale.set(bool(cfg.get("allow_upscale", self.allow_upscale.get())))
+        self.out_w.set(cfg.get("out_w", self.out_w.get()))
+        self.out_h.set(cfg.get("out_h", self.out_h.get()))
+        self.use_max_side.set(bool(cfg.get("use_max_side", self.use_max_side.get())))
+        self.max_side.set(cfg.get("max_side", self.max_side.get()))
+        self.use_align4.set(bool(cfg.get("use_align4", self.use_align4.get())))
+        self.align4_mode.set(cfg.get("align4_mode", self.align4_mode.get()))
+        self.enable_compress.set(bool(cfg.get("enable_compress", self.enable_compress.get())))
+        self.tinify_key.set(cfg.get("tinify_key", self.tinify_key.get()))
+        self.concurrency.set(cfg.get("concurrency", self.concurrency.get()))
+
+    def _save_settings(self):
+        data = {
+            "output_dir": self.output_dir.get(),
+            "suffix": self.suffix.get(),
+            "overwrite": bool(self.overwrite.get()),
+            "bg": self.bg.get(),
+            "allow_upscale": bool(self.allow_upscale.get()),
+            "out_w": self.out_w.get(),
+            "out_h": self.out_h.get(),
+            "use_max_side": bool(self.use_max_side.get()),
+            "max_side": self.max_side.get(),
+            "use_align4": bool(self.use_align4.get()),
+            "align4_mode": self.align4_mode.get(),
+            "enable_compress": bool(self.enable_compress.get()),
+            "tinify_key": self.tinify_key.get(),
+            "concurrency": self.concurrency.get(),
+        }
+        save_settings(data)
+
+    def _on_close(self):
+        self._save_settings()
+        self.destroy()
 
     # ---------------- logging ----------------
 
@@ -598,6 +680,7 @@ class App(RootBase):
             task.src_size[0], task.src_size[1],
             use_max_side=self.use_max_side.get(),
             max_side=ms,
+            allow_upscale=allow_up,
             use_align4=self.use_align4.get(),
             align_mode=self.align4_mode.get(),
             out_w=ow,
@@ -611,7 +694,7 @@ class App(RootBase):
         try:
             src_img = Image.open(task.src_path).convert("RGBA")
 
-            # 先预缩放到 base_size（只缩小）
+            # 先预缩放到 base_size（允许放大或缩小）
             if (bw, bh) != task.src_size:
                 src_img = src_img.resize((bw, bh), Image.LANCZOS)
 
@@ -662,25 +745,15 @@ class App(RootBase):
         self.preview_label.config(image=self._preview_tk)
 
         sw, sh = t.src_size
-        bw, bh = t.base_size
         cw, ch = t.canvas_size
-        rw, rh = t.resized_size
-
         total_scale = t.pre_scale * t.scale_to_canvas
-
-        pad_w = cw - rw
-        pad_h = ch - rh
 
         self.info_label.config(
             text=(
                 f"文件: {os.path.basename(t.src_path)}\n"
-                f"原始: {sw} x {sh}\n"
-                f"预缩放(base): {bw} x {bh}   pre_scale={t.pre_scale:.4f}\n"
-                f"画布(canvas, align4): {cw} x {ch}\n"
-                f"贴入尺寸(resized): {rw} x {rh}   scale_to_canvas={t.scale_to_canvas:.4f}\n"
-                f"总缩放(total_scale): {total_scale:.4f}\n"
-                f"padding: +{pad_w}w, +{pad_h}h (用于对齐/居中)\n"
-                f"(预览为扩图结果缩略图，不含压缩)"
+                f"变化前: {sw} x {sh}\n"
+                f"变化后: {cw} x {ch}\n"
+                f"缩放: {total_scale:.4f}"
             )
         )
 
